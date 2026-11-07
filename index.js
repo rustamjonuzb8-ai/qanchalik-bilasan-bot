@@ -349,7 +349,14 @@ bot.telegram
   ])
   .catch(() => {});
 
-bot.launch({ allowedUpdates: ["message", "callback_query", "poll_answer"] }).catch((e) => console.log("Launch xato:", e.message));
+// Deploy paytida eski nusxa hali ishlab turganda 409 chiqadi. Jim turib qolmaslik uchun
+// jarayon chiqib ketadi, Render uni o'zi qayta ishga tushiradi.
+bot
+  .launch({ allowedUpdates: ["message", "callback_query", "poll_answer"] })
+  .catch((e) => {
+    console.log("Launch xato, qayta ishga tushiriladi:", e.message);
+    setTimeout(() => process.exit(1), 3000);
+  });
 console.log("Bot ishga tushdi");
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
