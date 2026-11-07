@@ -2,6 +2,15 @@ const { Telegraf, Markup } = require("telegraf");
 const fs = require("fs");
 const QUESTIONS = require("./questions");
 
+// Render Web Service port ochiq bo'lishini talab qiladi
+require("http")
+  .createServer((req, res) => res.end("OK"))
+  .listen(process.env.PORT || 3000);
+
+if (!process.env.BOT_TOKEN) {
+  console.log("BOT_TOKEN qo'yilmagan. Render > Environment ga BOT_TOKEN qo'shing.");
+  return;
+}
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const DB_FILE = process.env.DB_FILE || "./data.json";
 const N = QUESTIONS.length;
