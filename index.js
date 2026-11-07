@@ -9,6 +9,15 @@ if (!process.env.BOT_TOKEN) {
   return;
 }
 
+// Render bepul tarifi 15 daqiqa so'rovsiz qolsa servisni uxlatadi. Har 5 daqiqada o'zimizga
+// so'rov yuborib uni uyg'oq ushlaymiz. RENDER_EXTERNAL_URL ni Render o'zi qo'yadi.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(SELF_URL).catch((e) => console.log("Ping xato:", e.message));
+  }, 5 * 60 * 1000);
+}
+
 const { Telegraf, Markup } = require("telegraf");
 const QUESTIONS = require("./questions");
 const L = require("./logic");
