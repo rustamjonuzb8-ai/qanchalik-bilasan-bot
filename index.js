@@ -189,7 +189,7 @@ function showOwnerQ(ctx, key, step) {
   const quiz = getQuiz(key);
   const n = quiz.qids.length;
   const q = QUESTIONS[quiz.qids[step]];
-  const rows = q.opts.map((o, i) => [Markup.button.callback(o, `o:${key}:${step}:${i}`)]);
+  const rows = (q.oo || q.opts).map((o, i) => [Markup.button.callback(o, `o:${key}:${step}:${i}`)]);
   rows.push([Markup.button.callback("🔄 Boshqa savol", `r:${key}:${step}`)]);
   return put(ctx, `${L.bar(step, n)}  ${step + 1}/${n}\n\n${q.o}`, Markup.inlineKeyboard(rows));
 }
