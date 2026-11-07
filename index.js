@@ -28,11 +28,12 @@ const LENGTHS = [5, 7, 10];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ------------------------------------------------------------------ baza
-let db = { quizzes: {}, polls: {} };
+let db = { quizzes: {}, polls: {}, users: {} };
 try {
   const d = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
   db.quizzes = d.quizzes || {};
   db.polls = d.polls || {};
+  db.users = d.users || {};
 } catch (e) {}
 let timer = null;
 const save = () => {
@@ -82,6 +83,288 @@ async function sendSticker(chatId, kind) {
   await bot.telegram.sendMessage(chatId, FALLBACK[kind]).catch(() => {});
 }
 
+// ------------------------------------------------------------------ foydalanuvchilar ro'yxati
+const seedUser = (id, name, t) => {
+  if (typeof id !== "number" || db.users[id]) return;
+  db.users[id] = { name: name || "Do'st", username: "", joined: t || Date.now(), last: 0, blocked: false };
+};
+const seedAll = () => {
+  for (const q of Object.values(db.quizzes)) {
+    seedUser(q.owner, q.ownerName, q.t);
+    for (const r of q.results || []) seedUser(r.id, r.name, q.t);
+  }
+};
+seedAll(); // eski testlardan egalari va yechganlarini ro'yxatga olamiz
+
+function touch(u) {
+  const x = (db.users[u.id] ||= { name: "", username: "", joined: Date.now(), last: 0, blocked: false });
+  x.name = nameOf(u);
+  x.username = u.username || "";
+  x.last = Date.now();
+  x.blocked = false;
+}
+bot.use((ctx, next) => {
+  if (ctx.from && !ctx.from.is_bot && ctx.updateType !== "my_chat_member") {
+    touch(ctx.from);
+    save();
+  }
+  return next();
+});
+// foydalanuvchi botni bloklasa/qayta ochsa belgilab qo'yamiz
+bot.on("my_chat_member", (ctx) => {
+  const u = db.users[ctx.from.id];
+  if (u && ctx.chat.type === "private") {
+    u.blocked = ["kicked", "left"].includes(ctx.myChatMember.new_chat_member.status);
+    save();
+  }
+});
+
+// ------------------------------------------------------------------ asosiy tugmalar (pastdagi doimiy klaviatura)
+const ADMINS = (process.env.ADMIN_IDS || "").split(",").map((s) => Number(s.trim())).filter(Boolean);
+const isAdmin = (id) => ADMINS.includes(id);
+const adminOnly = (ctx, next) => (isAdmin(ctx.from && ctx.from.id) ? next() : ctx.answerCbQuery("⛔ Faqat admin uchun"));
+
+const BTN = { new: "🎮 Test tuzish", res: "🏆 Natijalarim", links: "🔗 Havolalarim", help: "ℹ️ Yordam", admin: "🛠 Admin panel" };
+const MENU_TEXTS = Object.values(BTN);
+const mainKb = (id) => {
+  const rows = [[BTN.new, BTN.res], [BTN.links, BTN.help]];
+  if (isAdmin(id)) rows.push([BTN.admin]);
+  return Markup.keyboard(rows).resize();
+};
+
+// ------------------------------------------------------------------ admin panel
+const adminState = {}; // adminId -> { mode: "bc" | "confirm" | "restore", src, btn }
+const recipients = () => Object.keys(db.users).filter((id) => !db.users[id].blocked).map(Number);
+const DAY = 24 * 3600 * 1000;
+
+const PANEL_KB = Markup.inlineKeyboard([
+  [Markup.button.callback("📊 Statistika", "a:stats"), Markup.button.callback("👥 Foydalanuvchilar", "a:users")],
+  [Markup.button.callback("📢 Hammaga xabar yuborish", "a:bc")],
+  [Markup.button.callback("💾 Zaxira (backup)", "a:backup"), Markup.button.callback("♻️ Tiklash", "a:restore")],
+]);
+const BACK_KB = Markup.inlineKeyboard([[Markup.button.callback("🔙 Panelga qaytish", "a:home")]]);
+
+function panelText() {
+  const us = Object.values(db.users);
+  const now = Date.now();
+  return (
+    "🛠 Admin panel\n\n" +
+    `👥 Foydalanuvchilar: ${us.length}\n` +
+    `🆕 So'nggi 24 soatda: +${us.filter((u) => u.joined > now - DAY).length}\n` +
+    `📬 Xabar boradigan: ${recipients().length}\n\nTanlang 👇`
+  );
+}
+
+function statsText() {
+  const us = Object.values(db.users);
+  const now = Date.now();
+  const quizzes = Object.values(db.quizzes);
+  const solved = quizzes.reduce((s, q) => s + (q.results || []).length, 0);
+  const byOwner = {};
+  for (const q of quizzes) byOwner[q.owner] = (byOwner[q.owner] || 0) + (q.results || []).length;
+  const top = Object.entries(byOwner)
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([id, n], i) => `${i + 1}. ${(db.users[id] || {}).name || id}: ${n} kishi yechgan`);
+  return [
+    "📊 Statistika",
+    "",
+    `👥 Jami foydalanuvchi: ${us.length}`,
+    `✅ Faol (bloklamagan): ${us.filter((u) => !u.blocked).length}`,
+    `🚫 Botni bloklagan: ${us.filter((u) => u.blocked).length}`,
+    "",
+    `🆕 Yangi: 24 soatda ${us.filter((u) => u.joined > now - DAY).length}, 7 kunda ${us.filter((u) => u.joined > now - 7 * DAY).length}`,
+    `🟢 Faol: 24 soatda ${us.filter((u) => u.last > now - DAY).length}, 7 kunda ${us.filter((u) => u.last > now - 7 * DAY).length}`,
+    "",
+    `🎮 Tuzilgan testlar: ${quizzes.length}`,
+    `🎯 Yechilgan testlar: ${solved}`,
+    ...(top.length ? ["", "🏅 Eng ko'p yechilgan testlar egasi:", ...top] : []),
+  ].join("\n");
+}
+
+function usersText() {
+  const entries = Object.entries(db.users);
+  const list = entries
+    .sort((a, b) => b[1].joined - a[1].joined)
+    .slice(0, 15)
+    .map(([, u], i) => `${i + 1}. ${u.name}${u.username ? " @" + u.username : ""}${u.blocked ? " 🚫" : ""}`);
+  return "👥 So'nggi foydalanuvchilar:\n\n" + (list.join("\n") || "Hali yo'q") + `\n\nJami: ${entries.length}`;
+}
+
+function openPanel(ctx) {
+  if (!ADMINS.length) {
+    return ctx.reply(
+      `Admin hali sozlanmagan.\n\nSizning Telegram ID: ${ctx.from.id}\n\n` +
+        `Render > Environment ga ADMIN_IDS = ${ctx.from.id} qo'shing (bir nechta admin bo'lsa vergul bilan) va qayta deploy qiling.`
+    );
+  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply("Quyidagilardan birini tanlang 👇", mainKb(ctx.from.id));
+  delete adminState[ctx.from.id];
+  return ctx.reply(panelText(), PANEL_KB);
+}
+bot.command("admin", openPanel);
+bot.hears(BTN.admin, openPanel);
+bot.command("id", (ctx) => ctx.reply(`Sizning Telegram ID: ${ctx.from.id}`));
+bot.command("bekor", (ctx) => {
+  delete adminState[ctx.from.id];
+  return ctx.reply("Bekor qilindi ✅", mainKb(ctx.from.id));
+});
+
+bot.action("a:home", adminOnly, async (ctx) => {
+  await ctx.answerCbQuery();
+  delete adminState[ctx.from.id];
+  return put(ctx, panelText(), PANEL_KB);
+});
+bot.action("a:stats", adminOnly, async (ctx) => {
+  await ctx.answerCbQuery();
+  return put(ctx, statsText(), BACK_KB);
+});
+bot.action("a:users", adminOnly, async (ctx) => {
+  await ctx.answerCbQuery();
+  return put(ctx, usersText(), BACK_KB);
+});
+
+// --- hammaga xabar yuborish
+const confirmKb = (st) =>
+  Markup.inlineKeyboard([
+    [Markup.button.callback(st.btn ? "🔘 Tugma: ✅ bor" : "🔘 Tugma: ❌ yo'q", "a:bctoggle")],
+    [Markup.button.callback("✅ Yuborish", "a:bcgo"), Markup.button.callback("❌ Bekor", "a:home")],
+  ]);
+const confirmText = () =>
+  `👆 Xabar shunday ko'rinadi.\n\n${recipients().length} kishiga yuboraymi?\n\n` +
+  `"Tugma" yoqilsa, xabar tagida "🎮 Test tuzish" tugmasi chiqadi.`;
+
+bot.action("a:bc", adminOnly, async (ctx) => {
+  await ctx.answerCbQuery();
+  adminState[ctx.from.id] = { mode: "bc", btn: true };
+  return put(
+    ctx,
+    `📢 Xabar yuborish\n\nXabar ${recipients().length} kishiga boradi. Yubormoqchi bo'lgan xabaringizni shu yerga yuboring: ` +
+      `matn, rasm, video, ovozli xabar — hammasi bo'ladi.\n\nBekor qilish: /bekor`,
+    BACK_KB
+  );
+});
+
+bot.action("a:bctoggle", adminOnly, async (ctx) => {
+  const st = adminState[ctx.from.id];
+  if (!st || st.mode !== "confirm") return ctx.answerCbQuery("Xabar topilmadi");
+  st.btn = !st.btn;
+  await ctx.answerCbQuery(st.btn ? "Tugma yoqildi" : "Tugma o'chirildi");
+  try { await ctx.editMessageReplyMarkup(confirmKb(st).reply_markup); } catch (e) {}
+});
+
+let broadcasting = false;
+bot.action("a:bcgo", adminOnly, async (ctx) => {
+  const st = adminState[ctx.from.id];
+  if (!st || st.mode !== "confirm" || !st.src) return ctx.answerCbQuery("Xabar topilmadi, qaytadan boshlang");
+  if (broadcasting) return ctx.answerCbQuery("Hozir boshqa xabar yuborilmoqda ⏳");
+  broadcasting = true;
+  delete adminState[ctx.from.id];
+  await ctx.answerCbQuery("🚀 Boshlandi");
+  try { await ctx.editMessageReplyMarkup(); } catch (e) {}
+  const list = recipients();
+  const status = await ctx.reply(`🚀 Yuborilmoqda... 0/${list.length}`);
+  // fonda ishlaydi (uzoq davom etsa Telegraf timeout bermasligi uchun)
+  runBroadcast(ctx.chat.id, status.message_id, st, list)
+    .catch((e) => console.log("Broadcast xato:", e.message))
+    .finally(() => { broadcasting = false; });
+});
+
+async function runBroadcast(adminChat, statusId, st, list) {
+  const extra = st.btn ? Markup.inlineKeyboard([[Markup.button.callback("🎮 Test tuzish", "new")]]) : {};
+  const edit = (text, kb) => bot.telegram.editMessageText(adminChat, statusId, undefined, text, kb).catch(() => {});
+  let ok = 0, blocked = 0, fail = 0;
+  for (let i = 0; i < list.length; i++) {
+    const uid = list[i];
+    let res = null;
+    for (let attempt = 0; attempt < 3 && !res; attempt++) {
+      try {
+        await bot.telegram.copyMessage(uid, st.src.chat, st.src.id, extra);
+        res = "ok";
+      } catch (e) {
+        const r = e.response || {};
+        if (r.error_code === 429) {
+          await sleep((((r.parameters || {}).retry_after) || 5) * 1000 + 500);
+        } else if (r.error_code === 403 || /chat not found|deactivated/i.test(r.description || "")) {
+          res = "blocked";
+        } else {
+          res = "fail";
+        }
+      }
+    }
+    if (res === "ok") ok++;
+    else if (res === "blocked") {
+      blocked++;
+      if (db.users[uid]) db.users[uid].blocked = true;
+    } else fail++;
+    if ((i + 1) % 40 === 0) await edit(`🚀 Yuborilmoqda... ${i + 1}/${list.length}`);
+    await sleep(50); // sekundiga ~20 ta, Telegram limitidan past
+  }
+  save();
+  await edit(
+    `✅ Xabar yuborish tugadi!\n\n📬 Yetkazildi: ${ok}\n🚫 Botni bloklagan: ${blocked}\n⚠️ Xato: ${fail}`,
+    BACK_KB
+  );
+}
+
+// --- zaxira nusxa va tiklash (Render bepul tarifida fayl o'chib ketishi mumkin)
+bot.action("a:backup", adminOnly, async (ctx) => {
+  await ctx.answerCbQuery();
+  const name = `qanchalik-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  return ctx.replyWithDocument(
+    { source: Buffer.from(JSON.stringify({ users: db.users, quizzes: db.quizzes })), filename: name },
+    { caption: "💾 Zaxira nusxa. Baza o'chib ketsa, ♻️ Tiklash orqali shu faylni qaytarib yuboring." }
+  );
+});
+bot.action("a:restore", adminOnly, async (ctx) => {
+  await ctx.answerCbQuery();
+  adminState[ctx.from.id] = { mode: "restore" };
+  return put(
+    ctx,
+    "♻️ Tiklash\n\nZaxira .json faylini shu yerga yuboring. Mavjud ma'lumotlar o'chmaydi, faqat yo'q bo'lganlari qo'shiladi.\n\nBekor qilish: /bekor",
+    BACK_KB
+  );
+});
+
+// admin keyingi yuborgan xabarini ushlab oladi (xabar yuborish yoki tiklash rejimida)
+bot.use(async (ctx, next) => {
+  const st = ctx.from && adminState[ctx.from.id];
+  if (!st || ctx.updateType !== "message" || !isAdmin(ctx.from.id)) return next();
+  const m = ctx.message;
+  if (m.text && (m.text.startsWith("/") || MENU_TEXTS.includes(m.text))) {
+    delete adminState[ctx.from.id];
+    return next();
+  }
+  if (st.mode === "bc" || st.mode === "confirm") {
+    st.src = { chat: ctx.chat.id, id: m.message_id };
+    st.mode = "confirm";
+    await ctx.telegram.copyMessage(ctx.chat.id, ctx.chat.id, m.message_id);
+    return ctx.reply(confirmText(), confirmKb(st));
+  }
+  if (st.mode === "restore") {
+    if (!m.document) return ctx.reply("Iltimos, .json zaxira faylini yuboring yoki /bekor");
+    try {
+      const link = await ctx.telegram.getFileLink(m.document.file_id);
+      const data = await (await fetch(String(link))).json();
+      let addedUsers = 0, addedQuizzes = 0;
+      for (const [id, u] of Object.entries(data.users || {})) {
+        if (!db.users[id] && u && typeof u === "object") { db.users[id] = u; addedUsers++; }
+      }
+      for (const [k, q] of Object.entries(data.quizzes || {})) {
+        if (!db.quizzes[k] && q && Array.isArray(q.qids) && Array.isArray(q.answers)) { db.quizzes[k] = q; addedQuizzes++; }
+      }
+      seedAll();
+      save();
+      delete adminState[ctx.from.id];
+      return ctx.reply(`✅ Tiklandi: +${addedUsers} foydalanuvchi, +${addedQuizzes} test`, PANEL_KB);
+    } catch (e) {
+      return ctx.reply("❌ Faylni o'qib bo'lmadi: " + e.message);
+    }
+  }
+  return next();
+});
+
 // ------------------------------------------------------------------ menyu
 const MENU = Markup.inlineKeyboard([
   [Markup.button.callback("🎮 Test tuzish", "new")],
@@ -94,6 +377,7 @@ const HELP =
   "2️⃣ Bot sizga shaxsiy havola beradi, uni do'stingizga yuborasiz.\n" +
   "3️⃣ Do'stingiz sizning javoblaringizni topishga harakat qiladi (so'rovnoma shaklida).\n" +
   "4️⃣ Bot natijani foizda aytadi va sizga ham xabar yuboradi 😏\n\n" +
+  "Pastdagi tugmalar orqali ham boshqarishingiz mumkin 👇\n" +
   "Buyruqlar: /start, /natijalar, /yordam";
 
 const WELCOME =
@@ -114,7 +398,7 @@ bot.start(async (ctx) => {
   const quiz = key && getQuiz(key);
   if (!quiz) {
     await sendSticker(ctx.chat.id, "welcome");
-    return ctx.reply(WELCOME, MENU);
+    return ctx.reply(WELCOME, mainKb(ctx.from.id));
   }
   if (quiz.owner === ctx.from.id) {
     return ctx.reply("Bu sizning o'z testingiz 😄 Havolani do'stingizga yuboring!", await shareKb(key));
@@ -129,7 +413,8 @@ bot.start(async (ctx) => {
   await sendSticker(ctx.chat.id, "welcome");
   await ctx.reply(
     `👀 ${quiz.ownerName} sizga savol yubordi:\n\n"Meni qanchalik taniysan?" 😏\n\n` +
-      `${quiz.qids.length} ta savol bor. Har birida ${quiz.ownerName} nima tanlaganini toping!`
+      `${quiz.qids.length} ta savol bor. Har birida ${quiz.ownerName} nima tanlaganini toping!`,
+    mainKb(ctx.from.id)
   );
   await sleep(1200);
   return sendGuessQ(ctx.telegram, ctx.from.id, key, 0);
@@ -137,6 +422,32 @@ bot.start(async (ctx) => {
 
 bot.command("yordam", (ctx) => ctx.reply(HELP, MENU));
 bot.command("natijalar", (ctx) => showResults(ctx));
+
+// pastdagi doimiy tugmalar
+bot.hears(BTN.new, (ctx) => askLength(ctx));
+bot.hears(BTN.res, (ctx) => showResults(ctx));
+bot.hears(BTN.help, (ctx) => ctx.reply(HELP, MENU));
+bot.hears(BTN.links, (ctx) => myLinks(ctx));
+
+async function myLinks(ctx) {
+  const mine = Object.entries(db.quizzes)
+    .filter(([, q]) => q.owner === ctx.from.id && Array.isArray(q.answers) && q.answers.length === q.qids.length)
+    .sort((a, b) => b[1].t - a[1].t)
+    .slice(0, 5);
+  if (!mine.length) {
+    return ctx.reply(
+      "Hali test tuzmagansiz. Boshlaymizmi? 👇",
+      Markup.inlineKeyboard([[Markup.button.callback("🎮 Test tuzish", "new")]])
+    );
+  }
+  const lines = [];
+  for (const [key, q] of mine) {
+    lines.push(`🔗 ${await linkFor(key)}\n${q.qids.length} ta savol · ${(q.results || []).length} kishi yechgan`);
+  }
+  return ctx.reply("📤 Sizning so'nggi testlaringiz:\n\n" + lines.join("\n\n"), {
+    link_preview_options: { is_disabled: true },
+  });
+}
 bot.action("help", async (ctx) => {
   await ctx.answerCbQuery();
   return ctx.reply(HELP, MENU);
@@ -156,13 +467,16 @@ function showResults(ctx) {
 }
 
 // ------------------------------------------------------------------ test tuzish
-bot.action("new", async (ctx) => {
-  await ctx.answerCbQuery();
-  try { await ctx.editMessageReplyMarkup(); } catch (e) {}
-  return ctx.reply(
+const askLength = (ctx) =>
+  ctx.reply(
     "Nechta savoldan iborat test tuzamiz?",
     Markup.inlineKeyboard([LENGTHS.map((n) => Markup.button.callback(`${n} ta`, `len:${n}`))])
   );
+
+bot.action("new", async (ctx) => {
+  await ctx.answerCbQuery();
+  try { await ctx.editMessageReplyMarkup(); } catch (e) {}
+  return askLength(ctx);
 });
 
 bot.action(/^len:(\d+)$/, async (ctx) => {
@@ -347,7 +661,7 @@ async function finishGuess(tg, user, key, quiz, pr) {
 }
 
 // ------------------------------------------------------------------ boshqa xabarlar
-bot.on("text", (ctx) => ctx.reply("Quyidagilardan birini tanlang 👇", MENU));
+bot.on("text", (ctx) => ctx.reply("Quyidagilardan birini tanlang 👇", mainKb(ctx.from.id)));
 bot.catch((err) => console.log("Xato:", err.message));
 
 bot.telegram
@@ -361,7 +675,7 @@ bot.telegram
 // Deploy paytida eski nusxa hali ishlab turganda 409 chiqadi. Jim turib qolmaslik uchun
 // jarayon chiqib ketadi, Render uni o'zi qayta ishga tushiradi.
 bot
-  .launch({ allowedUpdates: ["message", "callback_query", "poll_answer"] })
+  .launch({ allowedUpdates: ["message", "callback_query", "poll_answer", "my_chat_member"] })
   .catch((e) => {
     console.log("Launch xato, qayta ishga tushiriladi:", e.message);
     setTimeout(() => process.exit(1), 3000);
