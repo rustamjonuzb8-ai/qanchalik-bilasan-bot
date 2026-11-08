@@ -406,7 +406,7 @@ bot.start(async (ctx) => {
   const prev = quiz.results.find((r) => r.id === ctx.from.id);
   if (prev) {
     return ctx.reply(
-      `Siz bu testni allaqachon yechgansiz: ${quiz.ownerName}ni ${prev.p}% taniysiz.\n\nO'zingiz ham test tuzib ko'ring 👇`,
+      `Siz bu testni allaqachon yechgansiz: ${L.sufName(quiz.ownerName, "ni")} ${prev.p}% taniysiz.\n\nO'zingiz ham test tuzib ko'ring 👇`,
       MENU
     );
   }
@@ -483,8 +483,11 @@ bot.action(/^len:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const n = Number(ctx.match[1]);
   if (!LENGTHS.includes(n)) return;
-  const rows = Object.entries(L.STYLES).map(([k, v]) => [Markup.button.callback(v.label, `sty:${n}:${k}`)]);
-  return put(ctx, "Qanday savollar bo'lsin?", Markup.inlineKeyboard(rows));
+  const btn = ([k, v]) => Markup.button.callback(v.label, `sty:${n}:${k}`);
+  const [mix, ...rest] = Object.entries(L.STYLES);
+  const rows = [[btn(mix)]];
+  for (let i = 0; i < rest.length; i += 2) rows.push(rest.slice(i, i + 2).map(btn));
+  return put(ctx, "Qanday savollar bo'lsin? 👇", Markup.inlineKeyboard(rows));
 });
 
 bot.action(/^sty:(\d+):(\w+)$/, async (ctx) => {
@@ -572,7 +575,7 @@ async function sendGuessQ(tg, uid, key, step) {
   const q = QUESTIONS[quiz.qids[step]];
   const order = L.shuffle([0, 1, 2, 3]);
   const correct = quiz.answers[step];
-  const head = `${step + 1}/${n} · ${quiz.ownerName} ${q.g}`;
+  const head = `${step + 1}/${n} · ${L.ask(quiz.ownerName, q.g)}`;
   try {
     // so'rovnoma (quiz): javob berishi bilan to'g'ri/xato darrov ko'rinadi
     const m = await tg.sendPoll(
@@ -647,7 +650,7 @@ async function finishGuess(tg, user, key, quiz, pr) {
 
   await tg.sendMessage(
     user.id,
-    `🎯 Siz ${quiz.ownerName}ni ${p}% taniysiz!\n\n${L.marks(pr.guesses, quiz.answers)}  (${right}/${n})\n${L.title(p)}` +
+    `🎯 Siz ${L.sufName(quiz.ownerName, "ni")} ${p}% taniysiz!\n\n${L.marks(pr.guesses, quiz.answers)}  (${right}/${n})\n${L.title(p)}` +
       (wrong.length ? `\n\n❌ Xatolaringiz:\n${wrong.join("\n")}` : "\n\n💯 Hammasini topdingiz!"),
     Markup.inlineKeyboard([[Markup.button.callback("🔥 Men seni qanchalik bilaman, tekshir!", "new")]])
   );
