@@ -21,6 +21,7 @@ if (SELF_URL) {
 const { Telegraf, Markup } = require("telegraf");
 const QUESTIONS = require("./questions");
 const L = require("./logic");
+const DAILY = require("./daily_questions");
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const DB_FILE = process.env.DB_FILE || "./data.json";
@@ -28,12 +29,16 @@ const LENGTHS = [5, 7, 10];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ------------------------------------------------------------------ baza
-let db = { quizzes: {}, polls: {}, users: {} };
+let db = { quizzes: {}, polls: {}, users: {}, daily: { done: "", days: {} } };
 try {
   const d = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
   db.quizzes = d.quizzes || {};
   db.polls = d.polls || {};
   db.users = d.users || {};
+  if (d.daily && typeof d.daily === "object") {
+    db.daily.done = typeof d.daily.done === "string" ? d.daily.done : "";
+    db.daily.days = d.daily.days && typeof d.daily.days === "object" ? d.daily.days : {};
+  }
 } catch (e) {}
 let timer = null;
 const save = () => {
@@ -124,10 +129,10 @@ const ADMINS = (process.env.ADMIN_IDS || "").split(",").map((s) => Number(s.trim
 const isAdmin = (id) => ADMINS.includes(id);
 const adminOnly = (ctx, next) => (isAdmin(ctx.from && ctx.from.id) ? next() : ctx.answerCbQuery("⛔ Faqat admin uchun"));
 
-const BTN = { new: "🎮 Test tuzish", res: "🏆 Natijalarim", links: "🔗 Havolalarim", help: "ℹ️ Yordam", admin: "🛠 Admin panel" };
+const BTN = { new: "🎮 Test tuzish", res: "🏆 Natijalarim", links: "🔗 Havolalarim", help: "ℹ️ Yordam", admin: "🛠 Admin panel", daily: "🎯 Kunlik savol" };
 const MENU_TEXTS = Object.values(BTN);
 const mainKb = (id) => {
-  const rows = [[BTN.new, BTN.res], [BTN.links, BTN.help]];
+  const rows = [[BTN.new, BTN.res], [BTN.links, BTN.daily], [BTN.help]];
   if (isAdmin(id)) rows.push([BTN.admin]);
   return Markup.keyboard(rows).resize();
 };
@@ -179,6 +184,7 @@ function statsText() {
     "",
     `🎮 Tuzilgan testlar: ${quizzes.length}`,
     `🎯 Yechilgan testlar: ${solved}`,
+    `📅 Kunlik savol: bugun ${todayAnswers()} kishi javob berdi, o'chirib qo'yganlar: ${us.filter((u) => u.nodq).length}`,
     ...(top.length ? ["", "🏅 Eng ko'p yechilgan testlar egasi:", ...top] : []),
   ].join("\n");
 }
@@ -313,7 +319,7 @@ bot.action("a:backup", adminOnly, async (ctx) => {
   await ctx.answerCbQuery();
   const name = `qanchalik-backup-${new Date().toISOString().slice(0, 10)}.json`;
   return ctx.replyWithDocument(
-    { source: Buffer.from(JSON.stringify({ users: db.users, quizzes: db.quizzes })), filename: name },
+    { source: Buffer.from(JSON.stringify({ users: db.users, quizzes: db.quizzes, daily: db.daily })), filename: name },
     { caption: "💾 Zaxira nusxa. Baza o'chib ketsa, ♻️ Tiklash orqali shu faylni qaytarib yuboring." }
   );
 });
@@ -354,6 +360,16 @@ bot.use(async (ctx, next) => {
       for (const [k, q] of Object.entries(data.quizzes || {})) {
         if (!db.quizzes[k] && q && Array.isArray(q.qids) && Array.isArray(q.answers)) { db.quizzes[k] = q; addedQuizzes++; }
       }
+      // kunlik savol holati: "bugun yuborilgan" belgisi va eski kunlarning ovozlari
+      const dd = data.daily;
+      if (dd && typeof dd === "object") {
+        if (typeof dd.done === "string" && dd.done > db.daily.done) db.daily.done = dd.done;
+        for (const [k, d] of Object.entries(dd.days || {})) {
+          if (!db.daily.days[k] && d && Number.isInteger(d.qi) && Array.isArray(d.votes) && d.voters && typeof d.voters === "object") {
+            db.daily.days[k] = d;
+          }
+        }
+      }
       seedAll();
       save();
       delete adminState[ctx.from.id];
@@ -378,7 +394,9 @@ const HELP =
   "3️⃣ Do'stingiz sizning javoblaringizni topishga harakat qiladi (so'rovnoma shaklida).\n" +
   "4️⃣ Bot natijani foizda aytadi va sizga ham xabar yuboradi 😏\n\n" +
   "Pastdagi tugmalar orqali ham boshqarishingiz mumkin 👇\n" +
-  "Buyruqlar: /start, /natijalar, /yordam";
+  "🎯 Har kuni kechqurun bot bitta qiziq savol yuboradi. Bugungisini /kunlik orqali ham ko'rishingiz mumkin.\n" +
+  "Kunlik savol kerak bo'lmasa: /kunlik_off, qayta yoqish: /kunlik_on\n\n" +
+  "Buyruqlar: /start, /natijalar, /reyting, /kunlik, /yordam";
 
 const WELCOME =
   "Salom! 👋\n\n🔥 Do'stlaringiz sizni qanchalik taniydi?\n" +
@@ -395,6 +413,12 @@ async function put(ctx, text, kb, forceNew) {
 
 bot.start(async (ctx) => {
   const key = ctx.startPayload;
+  if (key === "dq") {
+    // kunlik savol havolasi orqali kelgan yangi odam: salom + bugungi savol
+    await sendSticker(ctx.chat.id, "welcome");
+    await ctx.reply(WELCOME, mainKb(ctx.from.id));
+    return sendDaily(ctx);
+  }
   const quiz = key && getQuiz(key);
   if (!quiz) {
     await sendSticker(ctx.chat.id, "welcome");
@@ -422,10 +446,21 @@ bot.start(async (ctx) => {
 
 bot.command("yordam", (ctx) => ctx.reply(HELP, MENU));
 bot.command("natijalar", (ctx) => showResults(ctx));
+bot.command("reyting", (ctx) => showResults(ctx));
+bot.command("kunlik", (ctx) => sendDaily(ctx));
+bot.command("kunlik_off", (ctx) => {
+  setNoDaily(ctx.from.id, true);
+  return ctx.reply("🔕 Kunlik savol o'chirildi. Qayta yoqish: /kunlik_on");
+});
+bot.command("kunlik_on", (ctx) => {
+  setNoDaily(ctx.from.id, false);
+  return ctx.reply("🔔 Kunlik savol yoqildi! Har kuni kechqurun yangi savol yuboraman.");
+});
 
 // pastdagi doimiy tugmalar
 bot.hears(BTN.new, (ctx) => askLength(ctx));
 bot.hears(BTN.res, (ctx) => showResults(ctx));
+bot.hears(BTN.daily, (ctx) => sendDaily(ctx));
 bot.hears(BTN.help, (ctx) => ctx.reply(HELP, MENU));
 bot.hears(BTN.links, (ctx) => myLinks(ctx));
 
@@ -457,13 +492,9 @@ bot.action("res", async (ctx) => {
   return showResults(ctx);
 });
 
+// "🏆 Natijalarim" endi reyting: sizni eng yaxshi taniydigan do'stlar + umumiy reytingga o'tish tugmasi
 function showResults(ctx) {
-  const mine = Object.values(db.quizzes).filter((q) => q.owner === ctx.from.id && q.results);
-  const all = mine.flatMap((q) => q.results).sort((a, b) => b.p - a.p);
-  if (!all.length) return ctx.reply("Hali hech kim testingizni yechmagan. Havolani do'stlaringizga yuboring 📤", MENU);
-  const medal = ["🥇", "🥈", "🥉"];
-  const lines = all.slice(0, 10).map((r, i) => `${medal[i] || i + 1 + "."} ${r.name}: ${r.p}%`);
-  return ctx.reply("🏆 Sizni eng yaxshi taniydiganlar:\n\n" + lines.join("\n") + `\n\nJami: ${all.length} kishi yechgan`, MENU);
+  return ctx.reply(ratingText(ctx.from.id) || NO_RESULTS, ratingKb(ctx.from.id, "me"));
 }
 
 // ------------------------------------------------------------------ test tuzish
@@ -635,8 +666,9 @@ async function finishGuess(tg, user, key, quiz, pr) {
   const n = quiz.qids.length;
   const right = pr.guesses.filter((g, i) => g === quiz.answers[i]).length;
   const p = Math.round((right / n) * 100);
+  const dx = L.diagnosis(p); // kulgili tashxis (do'stga ham, egasiga ham bir xil ko'rinadi)
   if (!quiz.results.find((r) => r.id === user.id)) {
-    quiz.results.push({ id: user.id, name: nameOf(user), p, right, n });
+    quiz.results.push({ id: user.id, name: nameOf(user), p, right, n, dx: dx.idx });
   }
   save();
 
@@ -648,20 +680,316 @@ async function finishGuess(tg, user, key, quiz, pr) {
       return `${i + 1}) "${q.opts[g]}" dedingiz, aslida "${q.opts[quiz.answers[i]]}"`;
     });
 
+  // do'st natijasini o'z do'stlariga ulashishi uchun tugma (bot havolasi bilan)
+  const botLink = await botName().then((u) => `https://t.me/${u}`).catch(() => null);
+  const rows = [[Markup.button.callback("🔥 Men seni qanchalik bilaman, tekshir!", "new")]];
+  if (botLink) {
+    const shareText = `😎 Men ${L.sufName(quiz.ownerName, "ni")} ${p}% taniyman!\n${dx.text}\n\nSen meni qanchalik taniysan? 👇`;
+    rows.push([Markup.button.url("📤 Natijani do'stlarga ulashish", "https://t.me/share/url?url=" + encodeURIComponent(botLink) + "&text=" + encodeURIComponent(shareText))]);
+  }
   await tg.sendMessage(
     user.id,
-    `🎯 Siz ${L.sufName(quiz.ownerName, "ni")} ${p}% taniysiz!\n\n${L.marks(pr.guesses, quiz.answers)}  (${right}/${n})\n${L.title(p)}` +
+    `🎯 Siz ${L.sufName(quiz.ownerName, "ni")} ${p}% taniysiz!\n\n${L.marks(pr.guesses, quiz.answers)}  (${right}/${n})\n${L.title(p)}\n\n${dx.text}` +
       (wrong.length ? `\n\n❌ Xatolaringiz:\n${wrong.join("\n")}` : "\n\n💯 Hammasini topdingiz!"),
-    Markup.inlineKeyboard([[Markup.button.callback("🔥 Men seni qanchalik bilaman, tekshir!", "new")]])
+    Markup.inlineKeyboard(rows)
   );
   await sendSticker(user.id, L.mood(p));
 
-  tg.sendMessage(
-    quiz.owner,
-    `📩 ${nameOf(user)} testingizni yechdi!\n\nSizni ${p}% taniydi (${right}/${n})\n${L.title(p)}`,
-    Markup.inlineKeyboard([[Markup.button.callback("🏆 Hamma natijalar", "res")]])
-  ).catch(() => {});
+  const friendCount = friendsOf(quiz.owner).length;
+  shareKb(key)
+    .then((kb) =>
+      tg.sendMessage(
+        quiz.owner,
+        `📩 ${nameOf(user)} testingizni yechdi!\n\nSizni ${p}% taniydi (${right}/${n})\n${L.title(p)}\n\n${dx.text}\n\n👥 Hozircha ${friendCount} do'st yechgan`,
+        kb
+      )
+    )
+    .catch(() => {});
 }
+
+// ------------------------------------------------------------------ reyting
+const MEDAL = ["🥇", "🥈", "🥉"];
+const MIN_FRIENDS = 3; // umumiy reytingga kirish uchun kamida shuncha do'st testni yechgan bo'lishi kerak
+const NO_RESULTS = "Hali hech kim testingizni yechmagan. Havolani do'stlaringizga yuboring 📤";
+const shortName = (n) => {
+  const s = String(n || "Do'st").trim() || "Do'st";
+  return s.length > 20 ? s.slice(0, 19) + "…" : s;
+};
+
+// Egasining do'stlari. Bir do'st bir necha test yechgan bo'lsa ham bir marta sanaladi (eng yaxshi natijasi bilan).
+function friendsOf(ownerId) {
+  const best = new Map();
+  for (const q of Object.values(db.quizzes)) {
+    if (q.owner !== ownerId) continue;
+    for (const r of q.results || []) {
+      const old = best.get(r.id);
+      if (!old || r.p > old.p) best.set(r.id, { id: r.id, name: r.name, p: r.p });
+    }
+  }
+  return [...best.values()].sort((a, b) => b.p - a.p);
+}
+
+// Shaxsiy reyting: "Seni eng yaxshi biladigan do'stlar"
+function ratingText(uid) {
+  const fr = friendsOf(uid);
+  if (!fr.length) return null;
+  const avg = Math.round(fr.reduce((s, f) => s + f.p, 0) / fr.length);
+  const lines = fr.slice(0, 10).map((r, i) => `${MEDAL[i] || i + 1 + "."} ${shortName(r.name)}: ${r.p}%`);
+  return "🏆 Sizni eng yaxshi taniydiganlar:\n\n" + lines.join("\n") + `\n\n👥 Jami: ${fr.length} do'st yechgan\n📊 O'rtacha: ${avg}%`;
+}
+
+// Umumiy reyting: testini eng ko'p do'st yechgan odamlar. Faqat ism ko'rinadi, yashirish tugmasi bor.
+function globalBoard() {
+  const owners = new Set(Object.values(db.quizzes).map((q) => q.owner));
+  const rows = [];
+  for (const id of owners) {
+    const fr = friendsOf(id);
+    if (fr.length < MIN_FRIENDS) continue;
+    const u = db.users[id];
+    rows.push({
+      id,
+      name: u ? u.name : "Do'st",
+      hide: !!(u && u.hide),
+      n: fr.length,
+      avg: Math.round(fr.reduce((s, f) => s + f.p, 0) / fr.length),
+    });
+  }
+  return rows.sort((a, b) => b.n - a.n || b.avg - a.avg);
+}
+
+function globalText(uid) {
+  const all = globalBoard();
+  const vis = all.filter((r) => !r.hide);
+  const lines = vis.slice(0, 10).map((r, i) => `${MEDAL[i] || i + 1 + "."} ${shortName(r.name)}: ${r.n} do'st, o'rtacha ${r.avg}%`);
+  const mine = all.find((r) => r.id === uid);
+  let me;
+  if (mine && mine.hide) me = "🙈 Siz reytingdan yashirinib turibsiz. Boshqalar sizni ko'rmaydi.";
+  else if (mine) me = `📍 Sizning o'rningiz: ${vis.findIndex((r) => r.id === uid) + 1}-o'rin (${mine.n} do'st)`;
+  else me = `📍 Reytingga kirish uchun kamida ${MIN_FRIENDS} do'st testingizni yechishi kerak (hozir ${friendsOf(uid).length} ta).`;
+  return (
+    "🌍 Eng mashhurlar reytingi\n(testini ko'proq do'st yechgan odam yuqorida turadi)\n\n" +
+    (lines.length ? lines.join("\n") : "Hali hech kim reytingga kirmagan. Birinchi bo'ling! 🚀") +
+    "\n\n" +
+    me
+  );
+}
+
+function ratingKb(uid, view) {
+  const hidden = !!(db.users[uid] && db.users[uid].hide);
+  const rows = [
+    [view === "g" ? Markup.button.callback("👤 Mening reytingim", "rt:me") : Markup.button.callback("🌍 Umumiy reyting", "rt:g")],
+  ];
+  if (view === "g") {
+    rows.push([Markup.button.callback(hidden ? "👁 Reytingda ko'rinish" : "🙈 Reytingdan yashirinish", hidden ? "rt:show" : "rt:hide")]);
+  }
+  rows.push([Markup.button.callback("🎮 Test tuzish", "new")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+bot.action("rt:me", async (ctx) => {
+  await ctx.answerCbQuery();
+  return put(ctx, ratingText(ctx.from.id) || NO_RESULTS, ratingKb(ctx.from.id, "me"));
+});
+bot.action("rt:g", async (ctx) => {
+  await ctx.answerCbQuery();
+  return put(ctx, globalText(ctx.from.id), ratingKb(ctx.from.id, "g"));
+});
+bot.action(/^rt:(hide|show)$/, async (ctx) => {
+  const u = db.users[ctx.from.id];
+  if (u) {
+    u.hide = ctx.match[1] === "hide";
+    save();
+  }
+  await ctx.answerCbQuery(ctx.match[1] === "hide" ? "🙈 Endi reytingda ko'rinmaysiz" : "👁 Reytingda ko'rinasiz");
+  return put(ctx, globalText(ctx.from.id), ratingKb(ctx.from.id, "g"));
+});
+
+// ------------------------------------------------------------------ kunlik savol
+// Har kuni O'zbekiston vaqti bilan DAILY_HOUR da (standart 19:00) hammaga bitta savol yuboriladi.
+// Render'da DAILY_OFF=1 qo'ysangiz avtomatik yuborish to'xtaydi. DAILY_HOUR bilan soatni o'zgartirish mumkin.
+const TZ_MS = 5 * 3600 * 1000; // UTC+5, O'zbekistonda yozgi vaqt yo'q
+const envHour = process.env.DAILY_HOUR;
+const DAILY_HOUR = envHour && Number.isInteger(Number(envHour)) ? Math.min(23, Math.max(0, Number(envHour))) : 19;
+const DAILY_WINDOW = 3; // bot kech yoqilsa ham shu soatlar ichida yuboradi, undan keyin kechasi bezovta qilmaydi
+const DAILY_SKIP_AFTER = 45 * DAY; // 45 kundan beri jim turganlarga yubormaymiz
+
+const tkDate = () => new Date(Date.now() + TZ_MS);
+const todayKey = () => tkDate().toISOString().slice(0, 10);
+const prevKey = (key) => new Date(Date.parse(key + "T00:00:00Z") - DAY).toISOString().slice(0, 10);
+const dayQ = (day) => (day && DAILY[day.qi]) || null;
+const dayTotal = (day) => day.votes.reduce((s, v) => s + (Number(v) || 0), 0);
+const todayAnswers = () => {
+  const d = db.daily.days[todayKey()];
+  return d ? Object.keys(d.voters).length : 0;
+};
+
+// Kun yozuvi: qaysi savol (qi), ovozlar soni (votes), kim qaysi variantni tanlagan (voters). Oxirgi 4 kun saqlanadi.
+function ensureDay(key) {
+  const days = db.daily.days;
+  if (!days[key]) {
+    const qi = Math.floor(Date.parse(key + "T00:00:00Z") / DAY) % DAILY.length;
+    days[key] = { qi, votes: DAILY[qi].opts.map(() => 0), voters: {} };
+    for (const k of Object.keys(days).sort().slice(0, -4)) delete days[k];
+    save();
+  }
+  return days[key];
+}
+
+function prevSummary(key) {
+  const d = db.daily.days[prevKey(key)];
+  const q = dayQ(d);
+  if (!q || dayTotal(d) < 3) return "";
+  const total = dayTotal(d);
+  const top = d.votes.indexOf(Math.max(...d.votes));
+  return `📊 Kechagi savol: «${q.q}»\nEng ko'p tanlangan: ${q.opts[top]} (${Math.round((d.votes[top] / total) * 100)}%)\n\n`;
+}
+
+const dailyAsk = (key, day) =>
+  `🎯 Kunlik savol\n\n${prevSummary(key)}${dayQ(day).q}\n\n👇 Javobingizni tanlang. Boshqalar nima tanlaganini ham ko'rasiz!`;
+
+function dailyResult(day, uid) {
+  const q = dayQ(day);
+  const total = dayTotal(day);
+  const mine = day.voters[uid];
+  const lines = q.opts.map((o, i) => {
+    const pct = total ? Math.round((day.votes[i] / total) * 100) : 0;
+    const f = Math.round(pct / 10);
+    return `${o}${mine === i ? "  ✅ siz" : ""}\n${"▰".repeat(f)}${"▱".repeat(10 - f)} ${pct}%`;
+  });
+  return `🎯 Kunlik savol\n\n${q.q}\n\n${lines.join("\n\n")}\n\n👥 Jami ${total} kishi javob berdi`;
+}
+
+const dailyToggleBtn = (off) =>
+  Markup.button.callback(off ? "🔔 Kunlik savolni yoqish" : "🔕 Kunlik savolni o'chirish", off ? "dq:on" : "dq:off");
+
+// MUHIM: o'chirish/yoqish tugmasi doim OXIRGI qatorda turadi (dq:on/off uni shu joydan almashtiradi)
+async function dailyView(key, day, uid) {
+  const q = dayQ(day);
+  const off = !!(db.users[uid] && db.users[uid].nodq);
+  if (day.voters[uid] === undefined) {
+    return {
+      text: dailyAsk(key, day),
+      kb: Markup.inlineKeyboard([...q.opts.map((o, i) => [Markup.button.callback(o, `dq:${key}:${i}`)]), [dailyToggleBtn(off)]]),
+    };
+  }
+  const rows = [];
+  try {
+    const link = `https://t.me/${await botName()}?start=dq`;
+    const share =
+      "https://t.me/share/url?url=" + encodeURIComponent(link) + "&text=" + encodeURIComponent(`🎯 Bugungi savol: «${q.q}»\nSen nima tanlaysan? 👇`);
+    rows.push([Markup.button.url("📤 Do'stlarga yuborish", share)]);
+  } catch (e) {}
+  rows.push([Markup.button.callback("🎮 Do'stim meni qanchalik biladi? Test tuzish", "new")]);
+  rows.push([dailyToggleBtn(off)]);
+  return { text: dailyResult(day, uid), kb: Markup.inlineKeyboard(rows) };
+}
+
+async function sendDaily(ctx) {
+  const key = todayKey();
+  const day = ensureDay(key);
+  const v = await dailyView(key, day, ctx.from.id);
+  return ctx.reply(v.text, v.kb);
+}
+
+function setNoDaily(id, off) {
+  const u = db.users[id];
+  if (u) {
+    u.nodq = off;
+    save();
+  }
+}
+
+bot.action(/^dq:(\d{4}-\d{2}-\d{2}):([0-3])$/, async (ctx) => {
+  const key = ctx.match[1];
+  const opt = Number(ctx.match[2]);
+  const day = db.daily.days[key];
+  const q = dayQ(day);
+  if (!q || opt >= q.opts.length) {
+    await ctx.answerCbQuery("Bu savol eskirgan 😅");
+    try { await ctx.editMessageReplyMarkup(); } catch (e) {}
+    return;
+  }
+  const uid = ctx.from.id;
+  if (day.voters[uid] === undefined) {
+    day.votes[opt] = (Number(day.votes[opt]) || 0) + 1;
+    day.voters[uid] = opt;
+    save();
+    await ctx.answerCbQuery("✅ Javobingiz qabul qilindi");
+  } else {
+    await ctx.answerCbQuery("Siz allaqachon javob bergansiz ✅");
+  }
+  const v = await dailyView(key, day, uid);
+  try { await ctx.editMessageText(v.text, v.kb); } catch (e) {}
+});
+
+bot.action(/^dq:(on|off)$/, async (ctx) => {
+  const off = ctx.match[1] === "off";
+  setNoDaily(ctx.from.id, off);
+  await ctx.answerCbQuery(off ? "🔕 Kunlik savol o'chirildi. Qayta yoqish: /kunlik_on" : "🔔 Kunlik savol yoqildi!", { show_alert: true });
+  // faqat oxirgi qatordagi tugma matnini almashtiramiz
+  const m = ctx.callbackQuery.message;
+  if (m && m.reply_markup && Array.isArray(m.reply_markup.inline_keyboard)) {
+    const rows = m.reply_markup.inline_keyboard.map((r) => r.slice());
+    rows[rows.length - 1] = [dailyToggleBtn(off)];
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: rows }); } catch (e) {}
+  }
+});
+
+// --- avtomatik yuborish
+let dailyRunning = false;
+
+async function sendOneDaily(uid, v) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await bot.telegram.sendMessage(uid, v.text, v.kb);
+      return "ok";
+    } catch (e) {
+      const r = e.response || {};
+      if (r.error_code === 429) await sleep((((r.parameters || {}).retry_after) || 5) * 1000 + 500);
+      else if (r.error_code === 403 || /chat not found|deactivated/i.test(r.description || "")) return "blocked";
+      else return "fail";
+    }
+  }
+  return "fail";
+}
+
+async function runDaily(key) {
+  dailyRunning = true;
+  try {
+    const day = ensureDay(key);
+    if (!dayQ(day)) return;
+    const v = await dailyView(key, day, 0); // 0 = hali hech kim javob bermagan ko'rinish
+    const now = Date.now();
+    const list = Object.entries(db.users)
+      .filter(([id, u]) => !u.blocked && !u.nodq && u.dqDay !== key && day.voters[id] === undefined && (!u.last || u.last > now - DAILY_SKIP_AFTER))
+      .map(([id]) => Number(id))
+      .filter((id) => Number.isFinite(id));
+    let ok = 0, blocked = 0, fail = 0;
+    for (let i = 0; i < list.length; i++) {
+      const uid = list[i];
+      const res = await sendOneDaily(uid, v);
+      const u = db.users[uid];
+      if (res === "ok") { ok++; if (u) u.dqDay = key; }
+      else if (res === "blocked") { blocked++; if (u) u.blocked = true; }
+      else fail++;
+      if ((i + 1) % 10 === 0) save();
+      await sleep(50); // sekundiga ~20 ta, Telegram limitidan past
+    }
+    db.daily.done = key;
+    save();
+    console.log(`Kunlik savol ${key}: yuborildi ${ok}, bloklagan ${blocked}, xato ${fail}`);
+  } finally {
+    dailyRunning = false;
+  }
+}
+
+setInterval(() => {
+  if (process.env.DAILY_OFF === "1" || dailyRunning) return;
+  const key = todayKey();
+  const h = tkDate().getUTCHours();
+  if (h < DAILY_HOUR || h >= DAILY_HOUR + DAILY_WINDOW || db.daily.done === key) return;
+  runDaily(key).catch((e) => console.log("Kunlik savol xato:", e.message));
+}, 60 * 1000);
 
 // ------------------------------------------------------------------ boshqa xabarlar
 bot.on("text", (ctx) => ctx.reply("Quyidagilardan birini tanlang 👇", mainKb(ctx.from.id)));
@@ -670,7 +998,8 @@ bot.catch((err) => console.log("Xato:", err.message));
 bot.telegram
   .setMyCommands([
     { command: "start", description: "Boshlash" },
-    { command: "natijalar", description: "Mening natijalarim" },
+    { command: "natijalar", description: "Mening natijalarim va reyting" },
+    { command: "kunlik", description: "Bugungi kunlik savol" },
     { command: "yordam", description: "Qanday o'ynaladi" },
   ])
   .catch(() => {});

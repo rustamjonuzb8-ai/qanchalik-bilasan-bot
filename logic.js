@@ -69,4 +69,53 @@ function title(p) {
 
 const mood = (p) => (p >= 60 ? "win" : p >= 40 ? "mid" : "low");
 
-module.exports = { shuffle, STYLES, pool, pick, bar, marks, title, mood, cleanName, sufName, ask };
+// Kulgili "tashxis": har foiz oralig'i uchun bir nechta variant [tashxis, davo].
+// Sodda so'zlar, hech kimni haqorat qilmaydi. Yangi variant qo'shsangiz, ro'yxat OXIRIGA qo'shing.
+const DX = [
+  { min: 100, list: [
+    ["Ikkingiz egizak ekansiz! 👯", "Bir-biringizni tez-tez quchoqlang."],
+    ["Siz uning ichidagini ham o'qib qo'yibsiz 🧠", "Bu kuchni faqat yaxshilikka ishlating."],
+    ["Siz uning shaxsiy josusi bo'lsangiz kerak 🕵️", "Sirlarini hech kimga aytmang."],
+    ["Bu do'stlik emas, bu mo'jiza! ✨", "Hech narsa kerak emas, baribir zo'rsiz."],
+  ] },
+  { min: 80, list: [
+    ["Juda yaxshi do'stsiz! Deyarli hammasini bilasiz 🔥", "Birga choy ichib, yana gaplashing."],
+    ["Sal-pal yetmadi, lekin juda yaqinsiz 😎", "Haftada bir marta gaplashib turing."],
+    ["Siz unga ishonsa bo'ladigan do'stsiz 🤝", "Birga rasmga tushing."],
+    ["Zo'r natija! Bir-ikki sir qolibdi 🤫", "Uning sirlarini odob bilan so'rang."],
+  ] },
+  { min: 60, list: [
+    ["Yaxshi do'stsiz, lekin o'rganadigan narsa bor 🙂", "Birga ovqatlaning va ko'proq gaplashing."],
+    ["Taniysiz, lekin ba'zan adashasiz 😅", "Uning gaplariga diqqat bilan quloq soling."],
+    ["Yarmidan ko'pini bilasiz. Yomon emas! 👍", "Birga sayr qilib keling."],
+    ["Yaxshi tanish ekansiz, endi chin do'st bo'lish qoldi 😄", "Ko'proq savol bering."],
+  ] },
+  { min: 40, list: [
+    ["O'rtacha tanish ekansiz 😅", "Uchrashing, kafega boring, gaplashing."],
+    ["Yarmini bilasiz, yarmini o'ylab topdingiz 🤔", "Ko'proq so'rang, kamroq taxmin qiling."],
+    ["Hali bir-biringizni tanib ulgurmagansiz 🙈", "Bir soatlik suhbat yetadi."],
+    ["Yaqin do'st bo'lishga oz qolibdi 😆", "Birga kulgili video ko'ring."],
+  ] },
+  { min: 20, list: [
+    ["Siz uni sal-pal taniysiz 🤨", "Telefonni qo'ying, yuzma-yuz gaplashing."],
+    ["Taxminlaringiz shamolga o'xshaydi 🌬", "Uning sevimli narsalarini so'rab oling."],
+    ["Siz uni qo'shnisidek taniysiz 😄", "Birga tushlik qiling."],
+    ["Bu natija sizga ogohlantirish 🚨", "Bugunoq qo'ng'iroq qilib, hol so'rang."],
+  ] },
+  { min: 0, list: [
+    ["Siz uni umuman tanimas ekansiz 😂", "Tezroq yaqinroq tanishing!"],
+    ["Boshqa odam haqida test yechgandek bo'ldingiz 🤯", "Qaytadan tanishib chiqing."],
+    ["Siz boshqa odamni taniysiz shekilli 🙈", "Ismini qayta eslang va gaplashing."],
+    ["Aniq tashxis: ko'proq suhbat kerak! 📞", "Har kuni 5 daqiqa gaplashing."],
+  ] },
+];
+
+// idx berilsa o'sha variant, berilmasa tasodifiy. Natija: { idx, text }
+function diagnosis(p, idx) {
+  const tier = DX.find((t) => p >= t.min) || DX[DX.length - 1];
+  const i = Number.isInteger(idx) && idx >= 0 ? idx % tier.list.length : Math.floor(Math.random() * tier.list.length);
+  const [d, c] = tier.list[i];
+  return { idx: i, text: `🩺 Tashxis: ${d}\n💊 Davo: ${c}` };
+}
+
+module.exports = { shuffle, STYLES, pool, pick, bar, marks, title, mood, cleanName, sufName, ask, diagnosis };
