@@ -29,6 +29,7 @@ const LENGTHS = [5, 7, 10];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ------------------------------------------------------------------ baza
+let lastChange = 0; // bazadagi oxirgi o'zgarish vaqti (zaxira bilan solishtirish uchun)
 let db = { quizzes: {}, polls: {}, users: {}, daily: { done: "", days: {} } };
 try {
   const d = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
@@ -39,12 +40,18 @@ try {
     db.daily.done = typeof d.daily.done === "string" ? d.daily.done : "";
     db.daily.days = d.daily.days && typeof d.daily.days === "object" ? d.daily.days : {};
   }
+  lastChange = Number(d.ts) || 0;
 } catch (e) {}
 let timer = null;
 const save = () => {
+  lastChange = Date.now();
   clearTimeout(timer);
-  timer = setTimeout(() => fs.writeFile(DB_FILE, JSON.stringify(db), () => {}), 300);
+  timer = setTimeout(writeDbFile, 300);
+  scheduleBackup();
 };
+function writeDbFile() {
+  fs.writeFile(DB_FILE, JSON.stringify({ ...db, ts: lastChange }), () => {});
+}
 setInterval(() => {
   const old = Date.now() - 2 * 24 * 3600 * 1000;
   for (const k of Object.keys(db.polls)) if (db.polls[k].t < old) delete db.polls[k];
@@ -185,6 +192,7 @@ function statsText() {
     `🎮 Tuzilgan testlar: ${quizzes.length}`,
     `🎯 Yechilgan testlar: ${solved}`,
     `📅 Kunlik savol: bugun ${todayAnswers()} kishi javob berdi, o'chirib qo'yganlar: ${us.filter((u) => u.nodq).length}`,
+    `💾 Zaxira: ${backupStatus()}`,
     ...(top.length ? ["", "🏅 Eng ko'p yechilgan testlar egasi:", ...top] : []),
   ].join("\n");
 }
@@ -319,7 +327,7 @@ bot.action("a:backup", adminOnly, async (ctx) => {
   await ctx.answerCbQuery();
   const name = `qanchalik-backup-${new Date().toISOString().slice(0, 10)}.json`;
   return ctx.replyWithDocument(
-    { source: Buffer.from(JSON.stringify({ users: db.users, quizzes: db.quizzes, daily: db.daily })), filename: name },
+    { source: Buffer.from(JSON.stringify(backupData())), filename: name },
     { caption: "💾 Zaxira nusxa. Baza o'chib ketsa, ♻️ Tiklash orqali shu faylni qaytarib yuboring." }
   );
 });
@@ -353,25 +361,7 @@ bot.use(async (ctx, next) => {
     try {
       const link = await ctx.telegram.getFileLink(m.document.file_id);
       const data = await (await fetch(String(link))).json();
-      let addedUsers = 0, addedQuizzes = 0;
-      for (const [id, u] of Object.entries(data.users || {})) {
-        if (!db.users[id] && u && typeof u === "object") { db.users[id] = u; addedUsers++; }
-      }
-      for (const [k, q] of Object.entries(data.quizzes || {})) {
-        if (!db.quizzes[k] && q && Array.isArray(q.qids) && Array.isArray(q.answers)) { db.quizzes[k] = q; addedQuizzes++; }
-      }
-      // kunlik savol holati: "bugun yuborilgan" belgisi va eski kunlarning ovozlari
-      const dd = data.daily;
-      if (dd && typeof dd === "object") {
-        if (typeof dd.done === "string" && dd.done > db.daily.done) db.daily.done = dd.done;
-        for (const [k, d] of Object.entries(dd.days || {})) {
-          if (!db.daily.days[k] && d && Number.isInteger(d.qi) && Array.isArray(d.votes) && d.voters && typeof d.voters === "object") {
-            db.daily.days[k] = d;
-          }
-        }
-      }
-      seedAll();
-      save();
+      const { addedUsers, addedQuizzes } = mergeBackup(data);
       delete adminState[ctx.from.id];
       return ctx.reply(`✅ Tiklandi: +${addedUsers} foydalanuvchi, +${addedQuizzes} test`, PANEL_KB);
     } catch (e) {
@@ -991,6 +981,198 @@ setInterval(() => {
   runDaily(key).catch((e) => console.log("Kunlik savol xato:", e.message));
 }, 60 * 1000);
 
+// ------------------------------------------------------------------ avtomatik zaxira (Telegram'ga)
+// Render bepul tarifi har yangilanishda data.json ni o'chiradi. Shuning uchun bot bazani admin chatiga
+// FAYL qilib yuboradi va xabarni QADAYDI (pin). Bot qayta yoqilganda qadalgan faylni topib, o'zi tiklaydi.
+// Ma'lumot o'zgarsa 30 soniyadan keyin shu BIR xabarning fayli almashtiriladi (chat to'lib ketmaydi).
+// Muhim: admin shu chatda boshqa xabar qadamasin va zaxira xabarini o'chirmasin.
+const BACKUP_TAG = "QB-BACKUP";
+const BACKUP_CHAT = ADMINS[0]; // birinchi admin
+const BACKUP_DELAY = Number(process.env.BACKUP_DELAY_MS) || 30 * 1000;
+const RESTORE_RETRY = Number(process.env.RESTORE_RETRY_MS) || 4000;
+const MAX_BACKUP_BYTES = 19 * 1024 * 1024; // Telegram botga 20 MB gacha faylni qaytaradi
+let restoreOk = false; // tiklash tekshiruvi tugadimi (tugamaguncha zaxira ustiga yozmaymiz)
+let liveOk = false; // bot haqiqatan ishga tushdimi (deploy paytida eski nusxa ishlayotgan bo'lsa yozmaymiz)
+let backupTimer = null, backupBusy = false, backupMsgId = null;
+let backupTs = 0, lastBackupAt = 0, backupFails = 0, backupWarned = false, sizeWarned = false;
+
+const isEmptyDb = () => !Object.keys(db.users).length && !Object.keys(db.quizzes).length;
+const backupData = () => ({ users: db.users, quizzes: db.quizzes, daily: db.daily, polls: db.polls, ts: lastChange });
+const canBackup = () => !!BACKUP_CHAT && restoreOk && liveOk;
+
+function backupStatus() {
+  if (!BACKUP_CHAT) return "sozlanmagan (ADMIN_IDS kerak)";
+  if (!restoreOk) return "⚠️ o'chirilgan (zaxirani o'qib bo'lmadi)";
+  if (!lastBackupAt) {
+    if (!backupMsgId) return "hali yuborilmagan";
+    return backupTs >= lastChange ? "qadalgan zaxira bazaga mos" : "yangilanishi kutilmoqda";
+  }
+  const m = Math.floor((Date.now() - lastBackupAt) / 60000);
+  return (m < 1 ? "hozirgina" : `${m} daqiqa oldin`) + (backupFails ? ` (${backupFails} marta xato)` : "");
+}
+
+function scheduleBackup(delay) {
+  if (!canBackup() || backupTimer) return;
+  backupTimer = setTimeout(() => {
+    backupTimer = null;
+    doBackup().catch((e) => console.log("Zaxira xato:", e.message));
+  }, delay || BACKUP_DELAY);
+}
+
+// Yangi zaxirani qo'shib olish (mavjudni o'chirmaydi): admin qo'lda tiklaganda ham, kech tiklanganda ham shu ishlaydi
+function mergeBackup(data) {
+  let addedUsers = 0, addedQuizzes = 0;
+  for (const [id, u] of Object.entries((data && data.users) || {})) {
+    if (!db.users[id] && u && typeof u === "object") { db.users[id] = u; addedUsers++; }
+  }
+  for (const [k, q] of Object.entries((data && data.quizzes) || {})) {
+    if (!db.quizzes[k] && q && Array.isArray(q.qids) && Array.isArray(q.answers)) { db.quizzes[k] = q; addedQuizzes++; }
+  }
+  // kunlik savol holati: "bugun yuborilgan" belgisi va eski kunlarning ovozlari
+  const dd = data && data.daily;
+  if (dd && typeof dd === "object") {
+    if (typeof dd.done === "string" && dd.done > db.daily.done) db.daily.done = dd.done;
+    for (const [k, d] of Object.entries(dd.days || {})) {
+      if (!db.daily.days[k] && d && Number.isInteger(d.qi) && Array.isArray(d.votes) && d.voters && typeof d.voters === "object") {
+        db.daily.days[k] = d;
+      }
+    }
+  }
+  seedAll();
+  save();
+  return { addedUsers, addedQuizzes };
+}
+
+const tellAdmin = (text) => (BACKUP_CHAT ? bot.telegram.sendMessage(BACKUP_CHAT, text).catch(() => {}) : null);
+
+async function doBackup() {
+  if (!canBackup() || backupBusy) return;
+  if (isEmptyDb()) return; // bo'sh bazani yaxshi zaxira ustiga yozib yubormaymiz
+  backupBusy = true;
+  const ts = lastChange;
+  let retry = false;
+  try {
+    const buf = Buffer.from(JSON.stringify(backupData()));
+    if (buf.length > MAX_BACKUP_BYTES) {
+      if (!sizeWarned) {
+        sizeWarned = true;
+        tellAdmin("⚠️ Baza juda kattalashdi, avtomatik zaxira to'xtadi. Tashqi baza (Supabase) ulash vaqti keldi.");
+      }
+      return;
+    }
+    const file = () => ({ source: buf, filename: "qanchalik-zaxira.json" });
+    const when = new Date(Date.now() + 5 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 16);
+    const caption =
+      `${BACKUP_TAG} ts=${ts}\n💾 Avtomatik zaxira (${when}).\n` +
+      `Bu xabarni o'chirmang va shu chatda boshqa xabar qadamang.`;
+    let done = false;
+    if (backupMsgId) {
+      try {
+        await bot.telegram.editMessageMedia(BACKUP_CHAT, backupMsgId, undefined, { type: "document", media: file(), caption });
+        done = true;
+      } catch (e) {
+        if (/not modified/i.test(e.description || e.message || "")) done = true;
+        else backupMsgId = null; // xabar o'chirilgan bo'lishi mumkin: yangisini yuboramiz
+      }
+    }
+    if (!done) {
+      const m = await bot.telegram.sendDocument(BACKUP_CHAT, file(), { caption, disable_notification: true });
+      backupMsgId = m.message_id;
+      await bot.telegram
+        .pinChatMessage(BACKUP_CHAT, backupMsgId, { disable_notification: true })
+        .catch((e) => console.log("Qadash xato:", e.message));
+    }
+    backupTs = ts;
+    lastBackupAt = Date.now();
+    backupFails = 0;
+  } catch (e) {
+    backupFails++;
+    retry = true;
+    console.log("Zaxira yuborilmadi:", e.message);
+    if (backupFails === 5 && !backupWarned) {
+      backupWarned = true;
+      tellAdmin("⚠️ Zaxira 5 marta ketma-ket yuborilmadi. Bot ishlashda davom etadi, lekin zaxira yangilanmayapti.");
+    }
+  } finally {
+    backupBusy = false;
+    if (retry) scheduleBackup(60 * 1000);
+    else if (lastChange > backupTs) scheduleBackup();
+  }
+}
+
+// Bot yoqilganda: qadalgan zaxira bazadan yangiroq bo'lsa (yoki baza bo'sh bo'lsa), to'liq tiklaydi
+async function autoRestore(late) {
+  if (!BACKUP_CHAT) return false;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const pm = (await bot.telegram.getChat(BACKUP_CHAT)).pinned_message;
+      if (pm && pm.document && String(pm.caption || "").includes(BACKUP_TAG)) {
+        backupMsgId = pm.message_id;
+        const bts = Number((/ts=(\d+)/.exec(pm.caption) || [])[1]) || 0;
+        if (late && !isEmptyDb()) {
+          // zaxirani o'qib bo'lmagan paytda baza to'la boshlangan: ikkalasini qo'shamiz
+          const data = await fetchBackup(pm.document.file_id);
+          const r = mergeBackup(data);
+          console.log(`Kech tiklandi (qo'shildi): +${r.addedUsers} foydalanuvchi, +${r.addedQuizzes} test`);
+        } else if (isEmptyDb() || bts > lastChange) {
+          const data = await fetchBackup(pm.document.file_id);
+          db.users = data.users || {};
+          db.quizzes = data.quizzes || {};
+          db.polls = data.polls && typeof data.polls === "object" ? data.polls : {};
+          db.daily = {
+            done: data.daily && typeof data.daily.done === "string" ? data.daily.done : "",
+            days: data.daily && data.daily.days && typeof data.daily.days === "object" ? data.daily.days : {},
+          };
+          lastChange = Number(data.ts) || bts;
+          seedAll();
+          fs.writeFileSync(DB_FILE, JSON.stringify({ ...db, ts: lastChange }));
+          const msg = `${Object.keys(db.users).length} foydalanuvchi, ${Object.keys(db.quizzes).length} test`;
+          console.log("Zaxiradan tiklandi:", msg);
+          tellAdmin(`♻️ Bot qayta yoqildi va zaxiradan o'zi tiklandi: ${msg}.`);
+          backupTs = lastChange; // hozirgina tiklangan narsani qayta yubormaymiz
+        } else {
+          backupTs = bts; // bazamiz zaxiradan yangiroq: yangisini yuboramiz
+        }
+      }
+      restoreOk = true;
+      return true;
+    } catch (e) {
+      console.log(`Zaxirani tekshirib bo'lmadi (${attempt}/5):`, e.message);
+      await sleep(RESTORE_RETRY * attempt);
+    }
+  }
+  return false;
+}
+
+async function fetchBackup(fileId) {
+  const link = await bot.telegram.getFileLink(fileId);
+  const res = await fetch(String(link));
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const data = await res.json();
+  if (!data || typeof data !== "object" || typeof data.users !== "object" || typeof data.quizzes !== "object") {
+    throw new Error("zaxira fayli buzuq");
+  }
+  return data;
+}
+
+// Zaxirani o'qib bo'lmasa, eski yaxshi zaxira ustiga yozib yubormaslik uchun yuborish o'chiq turadi va qayta uriniladi
+function retryRestoreLater() {
+  const t = setTimeout(async () => {
+    if (await autoRestore(true)) {
+      if (lastChange > backupTs) scheduleBackup();
+    } else retryRestoreLater();
+  }, 2 * 60 * 1000);
+  if (t.unref) t.unref();
+}
+
+// Yangilanish yoki o'chirishdan oldin oxirgi marta zaxira olish
+async function finalBackup() {
+  clearTimeout(backupTimer);
+  backupTimer = null;
+  for (let i = 0; i < 40 && backupBusy; i++) await sleep(200);
+  if (canBackup() && lastChange > backupTs) await doBackup();
+}
+
 // ------------------------------------------------------------------ boshqa xabarlar
 bot.on("text", (ctx) => ctx.reply("Quyidagilardan birini tanlang 👇", mainKb(ctx.from.id)));
 bot.catch((err) => console.log("Xato:", err.message));
@@ -1006,12 +1188,38 @@ bot.telegram
 
 // Deploy paytida eski nusxa hali ishlab turganda 409 chiqadi. Jim turib qolmaslik uchun
 // jarayon chiqib ketadi, Render uni o'zi qayta ishga tushiradi.
-bot
-  .launch({ allowedUpdates: ["message", "callback_query", "poll_answer", "my_chat_member"] })
-  .catch((e) => {
-    console.log("Launch xato, qayta ishga tushiriladi:", e.message);
-    setTimeout(() => process.exit(1), 3000);
-  });
-console.log("Bot ishga tushdi");
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+async function start() {
+  // avval qadalgan zaxirani tekshiramiz (baza o'chib ketgan bo'lsa tiklaydi), keyin bot ishga tushadi
+  if (!(await autoRestore(false)) && BACKUP_CHAT) {
+    console.log("Zaxira tekshirilmadi: zaxira yuborish o'chirildi, 2 daqiqadan keyin qayta uriniladi");
+    retryRestoreLater();
+  }
+  bot
+    .launch({ allowedUpdates: ["message", "callback_query", "poll_answer", "my_chat_member"] })
+    .catch((e) => {
+      console.log("Launch xato, qayta ishga tushiriladi:", e.message);
+      setTimeout(() => process.exit(1), 3000);
+    });
+  console.log("Bot ishga tushdi");
+  // 15 soniya jarayon tirik tursa, bot haqiqatan ishga tushgan hisoblanadi (409 bo'lsa jarayon 3 soniyada chiqib ketadi)
+  const t = setTimeout(() => {
+    liveOk = true;
+    if (lastChange > backupTs) scheduleBackup();
+  }, Number(process.env.LIVE_DELAY_MS) || 15000);
+  if (t.unref) t.unref();
+}
+start();
+
+let stopping = false;
+async function shutdown(sig) {
+  if (stopping) return;
+  stopping = true;
+  try {
+    await Promise.race([finalBackup(), sleep(10000)]);
+  } catch (e) {}
+  try { fs.writeFileSync(DB_FILE, JSON.stringify({ ...db, ts: lastChange })); } catch (e) {}
+  try { bot.stop(sig); } catch (e) {}
+  process.exit(0);
+}
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
