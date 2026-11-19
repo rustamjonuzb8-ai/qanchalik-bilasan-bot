@@ -1,0 +1,16 @@
+name = "qanchalik-bilasan-bot"
+main = "src/worker.js"
+compatibility_date = "2025-06-01"
+
+[vars]
+BOT_USERNAME = "QanchalikBilasanBot"
+
+# Baza: Cloudflare D1. database_id ni baza yaratilgandan keyin shu yerga yozamiz.
+[[d1_databases]]
+binding = "DB"
+database_name = "qanchalik-bilasan-bot"
+database_id = "e7889ba6-e7de-4e1c-91bf-15178be2c1e2"
+
+# Har daqiqada ishlaydi: kunlik savol va "hammaga xabar" ni bo'laklab yuboradi.
+[triggers]
+crons = ["* * * * *"]
