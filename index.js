@@ -414,6 +414,10 @@ bot.start(async (ctx) => {
     await sendSticker(ctx.chat.id, "welcome");
     return ctx.reply(WELCOME, mainKb(ctx.from.id));
   }
+  if (quiz.answers.length !== quiz.qids.length) {
+    if (quiz.owner === ctx.from.id) return showOwnerQ(ctx, key, quiz.answers.length);
+    return ctx.reply("Bu test hali tayyorlanmoqda. Egasi tugatgach havolani yana oching.");
+  }
   if (quiz.owner === ctx.from.id) {
     return ctx.reply("Bu sizning o'z testingiz 😄 Havolani do'stingizga yuboring!", await shareKb(key));
   }
@@ -423,6 +427,14 @@ bot.start(async (ctx) => {
       `Siz bu testni allaqachon yechgansiz: ${L.sufName(quiz.ownerName, "ni")} ${prev.p}% taniysiz.\n\nO'zingiz ham test tuzib ko'ring 👇`,
       MENU
     );
+  }
+  quiz.progress ||= {};
+  const progress = quiz.progress[ctx.from.id];
+  const step = progress?.guesses.length || 0;
+  if (step === quiz.qids.length) return finishGuess(ctx.telegram, ctx.from, key, quiz, progress);
+  if (step > 0) {
+    await ctx.reply(`Davom etamiz! ${step} ta javobingiz saqlangan.`);
+    return sendGuessQ(ctx.telegram, ctx.from.id, key, step);
   }
   await sendSticker(ctx.chat.id, "welcome");
   await ctx.reply(
@@ -536,19 +548,22 @@ function showOwnerQ(ctx, key, step) {
   const quiz = getQuiz(key);
   const n = quiz.qids.length;
   const q = QUESTIONS[quiz.qids[step]];
-  const rows = (q.oo || q.opts).map((o, i) => [Markup.button.callback(o, `o:${key}:${step}:${i}`)]);
-  rows.push([Markup.button.callback("🔄 Boshqa savol", `r:${key}:${step}`)]);
+  const rows = (q.oo || q.opts).map((o, i) => [Markup.button.callback(o, `o:${key}:${step}:${i}:${quiz.qids[step]}`)]);
+  rows.push([Markup.button.callback("🔄 Boshqa savol", `r:${key}:${step}:${quiz.qids[step]}`)]);
   return put(ctx, `${L.bar(step, n)}  ${step + 1}/${n}\n\n${q.o}`, Markup.inlineKeyboard(rows));
 }
 
-bot.action(/^o:(\w+):(\d+):(\d)$/, async (ctx) => {
-  const [, key, stepS, optS] = ctx.match;
+bot.action(/^o:(\w+):(\d+):([0-3])(?::(\d+))?$/, async (ctx) => {
+  const [, key, stepS, optS, qid] = ctx.match;
   const step = Number(stepS);
   const quiz = getQuiz(key);
-  if (!quiz || quiz.owner !== ctx.from.id || quiz.answers.length !== step) return ctx.answerCbQuery();
-  await ctx.answerCbQuery("✅");
+  if (!quiz || quiz.owner !== ctx.from.id || quiz.answers.length !== step ||
+      step >= quiz.qids.length || (qid !== undefined && Number(qid) !== quiz.qids[step])) {
+    return ctx.answerCbQuery("Eng so'nggi savol tugmasini bosing.");
+  }
   quiz.answers.push(Number(optS));
   save();
+  await ctx.answerCbQuery("✅").catch(() => {});
   if (step + 1 < quiz.qids.length) return showOwnerQ(ctx, key, step + 1);
 
   const link = await linkFor(key);
@@ -556,23 +571,26 @@ bot.action(/^o:(\w+):(\d+):(\d)$/, async (ctx) => {
     ctx,
     `${L.bar(quiz.qids.length, quiz.qids.length)}  ✅ Test tayyor!\n\n` +
       `Mana sizning havolangiz:\n${link}\n\n` +
-      `Uni do'stlaringizga yuboring. Javoblaringiz sir saqlanadi, ular faqat taxmin qiladi 🤫`,
+      `Uni do'stlaringizga yuboring. Do'stingiz avval taxmin qiladi, keyin qaysi javobni tanlaganingizni ko'radi.`,
     await shareKb(key)
   );
   return sendSticker(ctx.chat.id, "win");
 });
 
-bot.action(/^r:(\w+):(\d+)$/, async (ctx) => {
-  const [, key, stepS] = ctx.match;
+bot.action(/^r:(\w+):(\d+)(?::(\d+))?$/, async (ctx) => {
+  const [, key, stepS, qid] = ctx.match;
   const step = Number(stepS);
   const quiz = getQuiz(key);
-  if (!quiz || quiz.owner !== ctx.from.id || quiz.answers.length !== step) return ctx.answerCbQuery();
+  if (!quiz || quiz.owner !== ctx.from.id || quiz.answers.length !== step ||
+      step >= quiz.qids.length || (qid !== undefined && Number(qid) !== quiz.qids[step])) {
+    return ctx.answerCbQuery("Eng so'nggi savol tugmasini bosing.");
+  }
   const free = L.pool(QUESTIONS, quiz.style).filter((i) => !quiz.qids.includes(i));
   if (!free.length) return ctx.answerCbQuery("Boshqa savol qolmadi 😅");
-  await ctx.answerCbQuery("🔄");
   quiz.qids[step] = free[Math.floor(Math.random() * free.length)];
   save();
-  return showOwnerQ(ctx, key, step);
+  await ctx.answerCbQuery("🔄").catch(() => {});
+  if (quiz.answers.length === step) return showOwnerQ(ctx, key, step);
 });
 
 async function shareKb(key) {
@@ -591,7 +609,7 @@ async function shareKb(key) {
 // ------------------------------------------------------------------ do'st taxmin qiladi
 async function sendGuessQ(tg, uid, key, step) {
   const quiz = getQuiz(key);
-  if (!quiz) return;
+  if (!quiz || step !== (quiz.progress?.[uid]?.guesses.length || 0) || step >= quiz.qids.length) return;
   const n = quiz.qids.length;
   const q = QUESTIONS[quiz.qids[step]];
   const order = L.shuffle([0, 1, 2, 3]);
@@ -634,18 +652,24 @@ bot.action(/^g:(\w+):(\d+):(\d)$/, async (ctx) => {
   await ctx.answerCbQuery();
   if (!quiz) return;
   try { await ctx.editMessageReplyMarkup(); } catch (e) {}
-  const right = Number(optS) === quiz.answers[Number(stepS)];
-  await ctx.reply(right ? "✅ To'g'ri topdingiz!" : "❌ Xato");
-  return recordGuess(ctx.telegram, ctx.from, key, Number(stepS), Number(optS));
+  const step = Number(stepS);
+  return recordGuess(ctx.telegram, ctx.from, key, step, Number(optS), (correct) => {
+    const text = Number(optS) === correct ? "✅ To'g'ri topdingiz!" :
+      `❌ Xato. To'g'ri javob: ${QUESTIONS[quiz.qids[step]].opts[correct]}`;
+    return ctx.reply(text).catch(() => {});
+  });
 });
 
-async function recordGuess(tg, user, key, step, real) {
+async function recordGuess(tg, user, key, step, real, feedback) {
   const quiz = getQuiz(key);
-  if (!quiz) return;
+  if (!quiz || quiz.owner === user.id || quiz.answers.length !== quiz.qids.length ||
+      step >= quiz.qids.length || !Number.isInteger(real) || real < 0 || real > 3) return;
+  quiz.progress ||= {};
   const pr = (quiz.progress[user.id] ||= { guesses: [] });
   if (pr.guesses.length !== step) return;
   pr.guesses.push(real);
   save();
+  if (feedback) await feedback(quiz.answers[step]);
   const n = quiz.qids.length;
   await sleep(1800);
   if (step + 1 < n) return sendGuessQ(tg, user.id, key, step + 1);
@@ -657,9 +681,8 @@ async function finishGuess(tg, user, key, quiz, pr) {
   const right = pr.guesses.filter((g, i) => g === quiz.answers[i]).length;
   const p = Math.round((right / n) * 100);
   const dx = L.diagnosis(p); // kulgili tashxis (do'stga ham, egasiga ham bir xil ko'rinadi)
-  if (!quiz.results.find((r) => r.id === user.id)) {
-    quiz.results.push({ id: user.id, name: nameOf(user), p, right, n, dx: dx.idx });
-  }
+  if (quiz.results.some((r) => r.id === user.id)) return;
+  quiz.results.push({ id: user.id, name: nameOf(user), p, right, n, dx: dx.idx });
   save();
 
   const wrong = pr.guesses
@@ -671,11 +694,11 @@ async function finishGuess(tg, user, key, quiz, pr) {
     });
 
   // do'st natijasini o'z do'stlariga ulashishi uchun tugma (bot havolasi bilan)
-  const botLink = await botName().then((u) => `https://t.me/${u}`).catch(() => null);
-  const rows = [[Markup.button.callback("🔥 Men seni qanchalik bilaman, tekshir!", "new")]];
-  if (botLink) {
-    const shareText = `😎 Men ${L.sufName(quiz.ownerName, "ni")} ${p}% taniyman!\n${dx.text}\n\nSen meni qanchalik taniysan? 👇`;
-    rows.push([Markup.button.url("📤 Natijani do'stlarga ulashish", "https://t.me/share/url?url=" + encodeURIComponent(botLink) + "&text=" + encodeURIComponent(shareText))]);
+  const quizLink = await linkFor(key).catch(() => null);
+  const rows = [[Markup.button.callback("🎮 O'zim haqimda test tuzish", "new")]];
+  if (quizLink) {
+    const shareText = `😎 Men ${L.sufName(quiz.ownerName, "ni")} ${p}% taniyman!\n${dx.text}\n\nSen ${L.sufName(quiz.ownerName, "ni")} qanchalik taniysan? Shu testni yechib ko'r 👇`;
+    rows.push([Markup.button.url("📤 Natijani do'stlarga ulashish", "https://t.me/share/url?url=" + encodeURIComponent(quizLink) + "&text=" + encodeURIComponent(shareText))]);
   }
   await tg.sendMessage(
     user.id,
