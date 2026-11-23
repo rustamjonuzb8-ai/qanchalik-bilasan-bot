@@ -197,13 +197,28 @@ function statsText() {
   ].join("\n");
 }
 
-function usersText() {
-  const entries = Object.entries(db.users);
-  const list = entries
-    .sort((a, b) => b[1].joined - a[1].joined)
-    .slice(0, 15)
-    .map(([, u], i) => `${i + 1}. ${u.name}${u.username ? " @" + u.username : ""}${u.blocked ? " 🚫" : ""}`);
-  return "👥 So'nggi foydalanuvchilar:\n\n" + (list.join("\n") || "Hali yo'q") + `\n\nJami: ${entries.length}`;
+function usersView(includeIdButtons = true) {
+  const entries = Object.entries(db.users).sort((a, b) => b[1].joined - a[1].joined);
+  let text = "👥 So'nggi foydalanuvchilar:\n\n";
+  const entities = [];
+  const rows = [];
+  for (const [index, [id, user]] of entries.slice(0, 15).entries()) {
+    const name = user.name || "Foydalanuvchi";
+    const username = /^[A-Za-z0-9_]+$/.test(user.username || "") ? user.username : "";
+    const url = username ? `https://t.me/${username}` :
+      includeIdButtons && /^[1-9]\d*$/.test(id) ? `tg://user?id=${id}` : null;
+    text += `${index + 1}. `;
+    const label = name + (username ? " @" + username : "");
+    if (url) {
+      entities.push({ type: "text_link", offset: text.length, length: label.length, url });
+      rows.push([Markup.button.url(`👤 ${index + 1}. ${username ? "@" + username : name}`, url)]);
+    }
+    text += label + (user.blocked ? " 🚫" : "") + "\n";
+  }
+  if (!entries.length) text += "Hali yo'q\n";
+  text += `\nJami: ${entries.length}`;
+  rows.push([Markup.button.callback("🔙 Panelga qaytish", "a:home")]);
+  return [text, { ...Markup.inlineKeyboard(rows), entities, link_preview_options: { is_disabled: true } }];
 }
 
 function openPanel(ctx) {
@@ -236,7 +251,13 @@ bot.action("a:stats", adminOnly, async (ctx) => {
 });
 bot.action("a:users", adminOnly, async (ctx) => {
   await ctx.answerCbQuery();
-  return put(ctx, usersText(), BACK_KB);
+  if (ctx.chat.type !== "private") return ctx.reply("Ro'yxatni botning shaxsiy chatidagi admin paneldan oching.");
+  try {
+    return await put(ctx, ...usersView());
+  } catch (error) {
+    if (!/BUTTON_USER_PRIVACY_RESTRICTED|BUTTON_USER_INVALID|USER_ID_INVALID|INPUT_USER_DEACTIVATED/i.test(error.description || error.message)) throw error;
+    return put(ctx, ...usersView(false));
+  }
 });
 
 // --- hammaga xabar yuborish
