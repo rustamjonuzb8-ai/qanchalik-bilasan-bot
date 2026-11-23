@@ -291,12 +291,33 @@ async function statsText(env) {
   ].join("\n");
 }
 
-async function usersText(env) {
-  const list = (await all(env, "SELECT name, username, blocked FROM users ORDER BY joined DESC LIMIT 15")).map(
-    (u, i) => `${i + 1}. ${u.name}${u.username ? " @" + u.username : ""}${u.blocked ? " 🚫" : ""}`
-  );
-  const total = (await first(env, "SELECT COUNT(*) c FROM users")).c;
-  return "👥 So'nggi foydalanuvchilar:\n\n" + (list.join("\n") || "Hali yo'q") + `\n\nJami: ${total}`;
+async function showUsers(ctx) {
+  if (ctx.chatId !== ctx.from.id) return ctx.reply("Ro'yxatni botning shaxsiy chatida oching.");
+  const users = await all(ctx.env, "SELECT id, name, username, blocked FROM users ORDER BY joined DESC LIMIT 15");
+  const total = (await first(ctx.env, "SELECT COUNT(*) c FROM users")).c;
+  const entities = [], rows = [];
+  let text = "👥 So'nggi foydalanuvchilar:\n\n";
+  for (const [i, u] of users.entries()) {
+    const username = u.username || "";
+    const label = (u.name || "Foydalanuvchi") + (username ? " @" + username : "");
+    const url = /^[a-z0-9_]+$/i.test(username) ? `https://t.me/${username}` : `tg://user?id=${u.id}`;
+    text += `${i + 1}. `;
+    entities.push({ type: "text_link", offset: text.length, length: label.length, url });
+    text += label + (u.blocked ? " 🚫" : "") + "\n";
+    rows.push([urlBtn(`👤 ${i + 1}. ${username ? "@" + username : u.name || "Profil"}`, url)]);
+  }
+  if (!users.length) text += "Hali yo'q\n";
+  text += `\nJami: ${total}`;
+  const options = (buttons, links) => ({
+    ...ik([...buttons, ...BACK_KB.reply_markup.inline_keyboard]), entities: links,
+    link_preview_options: { is_disabled: true },
+  });
+  try {
+    return await put(ctx, text, options(rows, entities));
+  } catch (e) {
+    if (!/BUTTON_USER_PRIVACY_RESTRICTED|BUTTON_USER_INVALID|USER_ID_INVALID|INPUT_USER_DEACTIVATED/i.test(e.desc || e.message)) throw e;
+    return put(ctx, text, options(rows.filter(([btn]) => btn.url.startsWith("https:")), entities.filter(link => link.url.startsWith("https:"))));
+  }
 }
 
 async function openPanel(ctx) {
@@ -500,7 +521,7 @@ async function adminAction(ctx, name) {
     return put(ctx, await panelText(env), PANEL_KB);
   }
   if (name === "stats") { await ctx.answer(); return put(ctx, await statsText(env), BACK_KB); }
-  if (name === "users") { await ctx.answer(); return put(ctx, await usersText(env), BACK_KB); }
+  if (name === "users") { await ctx.answer(); return showUsers(ctx); }
   if (name === "bc") {
     await ctx.answer();
     await setJ(env, `adm:${id}`, { mode: "bc", btn: true });
